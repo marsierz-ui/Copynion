@@ -49,6 +49,7 @@ except BaseException:  # noqa: BLE001 - see comment above
 KEY_BYTES = 32
 NONCE_BYTES = 12
 _AAD = b"copynion/title/v1"
+_AAD_BLOB = b"copynion/blob/v1"
 _KEYRING_SERVICE = "copynion"
 _KEYRING_USER = "vault-key"
 
@@ -169,6 +170,37 @@ class Vault:
             return AESGCM(self._key).decrypt(nonce, ct, _AAD).decode("utf-8")
         except InvalidTag as exc:
             raise VaultError("sealed value failed authentication (wrong key or tampering)") from exc
+
+    def seal_blob(self, data: bytes) -> bytes | None:
+        """Seal arbitrary bytes - used for compressed input batches.
+
+        A separate AAD from :meth:`seal` gives domain separation, so a sealed
+        title can never be swapped in for a sealed input batch or vice versa.
+        """
+        if not data:
+            return None
+        if self.available:
+            nonce = os.urandom(NONCE_BYTES)
+            return b"\x01" + nonce + AESGCM(self._key).encrypt(nonce, data, _AAD_BLOB)
+        if self.allow_unencrypted:
+            return b"\x00" + data
+        return None
+
+    def open_blob(self, blob: bytes | None) -> bytes | None:
+        if not blob:
+            return None
+        version, body = blob[:1], blob[1:]
+        if version == b"\x00":
+            return body
+        if version != b"\x01":
+            raise VaultError(f"unknown sealed-blob version {version!r}")
+        if not self.available:
+            raise VaultError("cannot decrypt: vault key unavailable")
+        nonce, ct = body[:NONCE_BYTES], body[NONCE_BYTES:]
+        try:
+            return AESGCM(self._key).decrypt(nonce, ct, _AAD_BLOB)
+        except InvalidTag as exc:
+            raise VaultError("sealed blob failed authentication") from exc
 
     def fingerprint(self, text: str, length: int = 16) -> str | None:
         """Stable keyed hash of ``text`` for grouping without decryption."""

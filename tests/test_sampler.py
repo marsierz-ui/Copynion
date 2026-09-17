@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from copynion.models import Visibility
+from copynion.models import Observation, Visibility
 from copynion.observer.backends import FakeBackend
 from copynion.observer.sampler import Sampler
 from tests.conftest import feed
@@ -123,3 +123,128 @@ def test_run_loop_stops_after_max_ticks(store, vault, settings, full_policy):
     s.settings.poll_interval_seconds = 0.001
     stats = s.run(max_ticks=5)
     assert stats.samples == 5
+
+
+# -- input capture integration ------------------------------------------------
+
+def _recorder(fidelity="full", **kw):
+    from copynion.inputs.recorder import InputRecorder, RecorderSettings
+
+    return InputRecorder(RecorderSettings(fidelity=fidelity, **kw))
+
+
+def _sampler_with_input(store, vault, settings, policy, recorder):
+    return Sampler(FakeBackend([]), store, policy=policy, vault=vault,
+                   settings=settings, recorder=recorder, clock=lambda: 0.0)
+
+
+def test_input_is_attached_to_the_span_it_happened_in(store, vault, settings, full_policy):
+    rec = _recorder(redact_typed_text=False)
+    s = _sampler_with_input(store, vault, settings, full_policy, rec)
+    t = 10_000.0
+    s.ingest(Observation(t, "code", "a.py", backend="f"))
+    for ch in "hello":
+        rec.record_key(ch, t)
+        t += 0.2
+    t = 10_010.0
+    s.ingest(Observation(t, "firefox", "docs", backend="f"))
+    for ch in "world":
+        rec.record_key(ch, t)
+        t += 0.2
+    s._flush(10_020.0)
+
+    spans = store.spans()
+    assert [store.inputs_of(sp["id"]).events[0].text for sp in spans] == ["hello", "world"]
+
+
+def test_policy_denied_app_suppresses_input(store, vault, settings):
+    """Input must never outlive the policy that hides the window's title."""
+    from copynion.privacy import Policy
+
+    rec = _recorder(redact_typed_text=False)
+    policy = Policy(app_rules={"code": "full", "1password": "drop"})
+    s = _sampler_with_input(store, vault, settings, policy, rec)
+
+    t = 10_000.0
+    s.ingest(Observation(t, "code", "a.py", backend="f"))
+    for ch in "public":
+        rec.record_key(ch, t)
+        t += 0.1
+    t = 10_010.0
+    s.ingest(Observation(t, "1password", "Bank", backend="f"))
+    for ch in "hunter2":
+        rec.record_key(ch, t)
+        t += 0.1
+    s._flush(10_020.0)
+
+    stored = " ".join(
+        str(store.inputs_of(sp["id"]).to_dict()) for sp in store.spans()
+        if store.inputs_of(sp["id"])
+    )
+    assert "public" in stored
+    assert "hunter2" not in stored
+    assert s.stats.input_suppressed == 7
+
+
+def test_app_only_visibility_also_suppresses_input(store, vault, settings):
+    """Hiding titles while recording every keystroke would make the policy a lie."""
+    from copynion.privacy import Policy
+
+    rec = _recorder(redact_typed_text=False)
+    s = _sampler_with_input(store, vault, settings, Policy(), rec)  # default app_only
+    t = 10_000.0
+    s.ingest(Observation(t, "someapp", "Client X", backend="f"))
+    for ch in "sensitive":
+        rec.record_key(ch, t)
+        t += 0.1
+    s._flush(10_020.0)
+    assert store.counts()["input_batches"] == 0
+    assert s.stats.input_suppressed == 9
+
+
+def test_input_is_banked_before_a_denied_window_suppresses_it(store, vault, settings):
+    """The buffer at suppression time belongs to the previous, permitted window."""
+    from copynion.privacy import Policy
+
+    rec = _recorder(redact_typed_text=False)
+    policy = Policy(app_rules={"code": "full", "1password": "drop"})
+    s = _sampler_with_input(store, vault, settings, policy, rec)
+
+    t = 10_000.0
+    s.ingest(Observation(t, "code", "a.py", backend="f"))
+    for ch in "typed":  # never terminated by Enter - only the flush commits it
+        rec.record_key(ch, t)
+        t += 0.1
+    s.ingest(Observation(10_010.0, "1password", "Bank", backend="f"))
+    s._flush(10_020.0)
+
+    batches = [store.inputs_of(sp["id"]) for sp in store.spans()]
+    texts = [e.text for b in batches if b for e in b.events]
+    assert "typed" in texts, "input from the permitted window was discarded"
+
+
+def test_pause_stops_input_capture(store, vault, settings, full_policy):
+    rec = _recorder(redact_typed_text=False)
+    s = _sampler_with_input(store, vault, settings, full_policy, rec)
+    t = 10_000.0
+    s.ingest(Observation(t, "code", "a.py", backend="f"))
+    full_policy.pause("lunch")
+    s.ingest(Observation(10_010.0, "code", "a.py", backend="f"))
+    for ch in "private":
+        rec.record_key(ch, 10_011.0)
+    s._flush(10_020.0)
+    stored = " ".join(
+        str(store.inputs_of(sp["id"]).to_dict()) for sp in store.spans()
+        if store.inputs_of(sp["id"])
+    )
+    assert "private" not in stored
+
+
+def test_no_recorder_means_no_input_columns(store, vault, settings, full_policy):
+    s = Sampler(FakeBackend([]), store, policy=full_policy, vault=vault,
+                settings=settings, clock=lambda: 0.0)
+    feed(s, [("code", "a.py")] * 4)
+    s._flush(10_020.0)
+    row = store.spans()[0]
+    assert row["keystrokes"] == 0 and row["clicks"] == 0
+    assert store.counts()["input_batches"] == 0

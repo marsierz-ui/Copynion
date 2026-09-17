@@ -131,6 +131,16 @@ class Summary:
     recurring_windows: list[RecurringWindow] = field(default_factory=list)
     sequences: list[SequencePattern] = field(default_factory=list)
 
+    # Input aggregates. Present whenever input capture was on at any tier;
+    # these come from content-free plaintext columns, so they are available even
+    # after the recorded events themselves have expired.
+    keystrokes: int = 0
+    clicks: int = 0
+    scrolls: int = 0
+    mouse_distance: float = 0.0
+    input_by_category: dict[str, tuple[int, int]] = field(default_factory=dict)
+    """category -> (keystrokes, clicks)"""
+
     # -- derived ---------------------------------------------------------------
 
     @property
@@ -158,6 +168,31 @@ class Summary:
         day stops containing any recoverable deep work.
         """
         return min(1.0, self.switches_per_active_hour / 30.0)
+
+    @property
+    def has_input_data(self) -> bool:
+        return bool(self.keystrokes or self.clicks or self.scrolls)
+
+    @property
+    def keys_per_active_minute(self) -> float:
+        minutes = self.active_seconds / 60.0
+        return self.keystrokes / minutes if minutes > 0.5 else 0.0
+
+    @property
+    def clicks_per_active_minute(self) -> float:
+        minutes = self.active_seconds / 60.0
+        return self.clicks / minutes if minutes > 0.5 else 0.0
+
+    @property
+    def typing_share(self) -> float:
+        """Keystrokes as a fraction of all discrete input actions.
+
+        Near 1.0 means the work is typing; near 0.0 means it is navigating and
+        clicking. The latter is the classic shape of automatable form-filling
+        and file-shuffling work.
+        """
+        total = self.keystrokes + self.clicks
+        return self.keystrokes / total if total else 0.0
 
     @property
     def mean_span_seconds(self) -> float:
@@ -232,6 +267,22 @@ class Summary:
                 ),
                 "fragmentation": round(self.fragmentation, 3),
             },
+            "input": {
+                "captured": self.has_input_data,
+                "keystrokes": self.keystrokes,
+                "clicks": self.clicks,
+                "scrolls": self.scrolls,
+                "mouse_distance_px": round(self.mouse_distance, 1),
+                "keys_per_active_minute": round(self.keys_per_active_minute, 1),
+                "clicks_per_active_minute": round(self.clicks_per_active_minute, 1),
+                "typing_share": round(self.typing_share, 3),
+                "by_category": {
+                    name: {"keystrokes": k, "clicks": c}
+                    for name, (k, c) in sorted(
+                        self.input_by_category.items(), key=lambda kv: -(kv[1][0] + kv[1][1])
+                    )
+                },
+            },
             "hourly_seconds": {str(h): round(s, 1) for h, s in sorted(self.hourly_seconds.items())},
             "repetition": {
                 "share_of_active_time": round(self.repetition_share, 4),
@@ -298,6 +349,17 @@ def summarise(
 
         summary.active_seconds += duration
         category = row.get("category") or "uncategorised"
+
+        keys = int(row.get("keystrokes") or 0)
+        clicks = int(row.get("clicks") or 0)
+        summary.keystrokes += keys
+        summary.clicks += clicks
+        summary.scrolls += int(row.get("scrolls") or 0)
+        summary.mouse_distance += float(row.get("mouse_distance") or 0.0)
+        if keys or clicks:
+            prev_k, prev_c = summary.input_by_category.get(category, (0, 0))
+            summary.input_by_category[category] = (prev_k + keys, prev_c + clicks)
+
         app = row.get("app") or "(unknown)"
         cat_seconds[category] += duration
         cat_counts[category] += 1

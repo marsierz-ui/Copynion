@@ -141,3 +141,117 @@ def test_titles_are_not_readable_without_the_key(tmp_path):
     with pytest.raises(VaultError, match="failed authentication"):
         stranger.title_of(1)
     stranger.close()
+
+
+# -- input capture storage ----------------------------------------------------
+
+def _batch(fidelity="full", text="invoice for bob@acme.com"):
+    from copynion.inputs.recorder import InputRecorder, RecorderSettings
+
+    r = InputRecorder(RecorderSettings(fidelity=fidelity))
+    at = 0.0
+    for ch in text:
+        r.record_key(ch, at)
+        at += 0.05
+    r.record_click("left", 120, 340, at)
+    return r.take_batch(at + 1)
+
+
+def test_input_batch_roundtrips(store):
+    span = make_span(store)
+    store.add_span(span, _batch())
+    restored = store.inputs_of(span.id)
+    assert restored is not None
+    assert restored.events[0].text.endswith("<email>")
+    assert restored.counters.clicks == 1
+
+
+def test_input_counters_are_plaintext_on_the_span(store):
+    """Counts contain no content, so statistics can use them without decrypting."""
+    span = make_span(store)
+    store.add_span(span, _batch())
+    row = store.spans()[-1]
+    assert row["keystrokes"] == 24  # len("invoice for bob@acme.com")
+    assert row["clicks"] == 1
+
+
+def test_recorded_input_is_not_readable_in_the_raw_database(tmp_path):
+    vault = Vault(Vault.generate_key())
+    store = Store(tmp_path / "c.db", vault)
+    span = make_span(store)
+    store.add_span(span, _batch(text="the secret passphrase is orange"))
+    store.close()
+    raw = (tmp_path / "c.db").read_bytes()
+    assert b"orange" not in raw
+    assert b"passphrase" not in raw
+
+
+def test_forget_inputs_keeps_spans_and_counters(store):
+    span = make_span(store)
+    store.add_span(span, _batch())
+    assert store.forget_inputs() == 1
+    assert store.inputs_of(span.id) is None
+    assert store.spans()[-1]["keystrokes"] == 24
+
+
+def test_input_expires_before_titles_and_spans(store):
+    """Input has the shortest retention because it is the most revealing."""
+    span = make_span(store, offset=10 * 86400)
+    store.add_span(span, _batch())
+    removed = store.enforce_retention(detail_days=90, title_days=30, input_days=7)
+    assert removed["inputs"] == 1
+    assert store.counts()["spans"] >= 1
+    assert store.counts()["titles"] >= 1
+
+
+def test_purge_all_removes_input(store):
+    span = make_span(store)
+    store.add_span(span, _batch())
+    store.purge(everything=True)
+    assert store.counts()["input_batches"] == 0
+
+
+def test_empty_batch_writes_no_row(store):
+    from copynion.inputs.events import InputBatch
+
+    span = make_span(store)
+    store.add_span(span, InputBatch())
+    assert store.counts()["input_batches"] == 0
+
+
+def test_migration_from_v1_adds_input_support(tmp_path):
+    """A database written by the previous schema must upgrade, not break."""
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(str(path))
+    conn.executescript(
+        """
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO meta VALUES ('schema_version', '1');
+        CREATE TABLE spans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, started_at REAL NOT NULL,
+            ended_at REAL NOT NULL, duration REAL NOT NULL, day TEXT NOT NULL,
+            app TEXT NOT NULL DEFAULT '', title_hash TEXT,
+            category TEXT NOT NULL DEFAULT 'uncategorised', subcategory TEXT,
+            rule_id TEXT, confidence REAL NOT NULL DEFAULT 0.0,
+            afk INTEGER NOT NULL DEFAULT 0,
+            visibility TEXT NOT NULL DEFAULT 'app_only',
+            sample_count INTEGER NOT NULL DEFAULT 1,
+            backend TEXT NOT NULL DEFAULT 'unknown');
+        INSERT INTO spans (started_at, ended_at, duration, day, app)
+             VALUES (1000, 1300, 300, '2026-01-01', 'code');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = Store(path, Vault(Vault.generate_key()))
+    assert store.spans()[0]["app"] == "code"
+    assert store.spans()[0]["keystrokes"] == 0  # new column, defaulted
+
+    span = make_span(store)
+    store.add_span(span, _batch())
+    assert store.counts()["input_batches"] == 1
+    assert "migrate" in [r["action"] for r in store.audit_entries()]
+    store.close()

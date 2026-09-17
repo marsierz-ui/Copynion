@@ -82,6 +82,24 @@ class PrivacySettings:
 
 
 @dataclass(slots=True)
+class InputSettings:
+    """Keystroke and mouse capture. Off unless deliberately switched on."""
+
+    fidelity: str = "off"
+    """``off`` | ``counts`` | ``structure`` | ``full``.
+
+    Only ``full`` supports exact replay, and only ``full`` records literal
+    characters. See docs/PRIVACY.md before raising this.
+    """
+
+    redact_typed_text: bool = True
+    capture_mouse_moves: bool = True
+    move_min_distance: float = 40.0
+    move_max_interval: float = 0.5
+    max_events_per_span: int = 5000
+
+
+@dataclass(slots=True)
 class RetentionSettings:
     detail_days: int = 90
     """Per-window records older than this are deleted. Rollups survive."""
@@ -89,19 +107,28 @@ class RetentionSettings:
     title_days: int = 30
     """Titles expire sooner than the spans that carry them."""
 
+    input_days: int = 7
+    """Recorded keystrokes and mouse events expire soonest of all - they are the
+    most revealing thing stored, and their value for finding repeated processes
+    is concentrated in the recent past."""
+
 
 @dataclass(slots=True)
 class Config:
     observation: ObservationSettings = field(default_factory=ObservationSettings)
     privacy: PrivacySettings = field(default_factory=PrivacySettings)
+    inputs: InputSettings = field(default_factory=InputSettings)
     retention: RetentionSettings = field(default_factory=RetentionSettings)
     path: Path | None = None
+    database_override: Path | None = None
+    """Set by ``--database`` so commands can be pointed at another file, such as
+    the demo database, without touching the real one."""
 
     # -- derived paths --------------------------------------------------------
 
     @property
     def db_path(self) -> Path:
-        return data_dir() / "copynion.db"
+        return self.database_override or (data_dir() / "copynion.db")
 
     @property
     def key_path(self) -> Path:
@@ -129,6 +156,7 @@ class Config:
         for section, target in (
             ("observation", cfg.observation),
             ("privacy", cfg.privacy),
+            ("input", cfg.inputs),
             ("retention", cfg.retention),
         ):
             for key, value in (raw.get(section) or {}).items():
@@ -151,6 +179,12 @@ class Config:
         for app, vis in self.privacy.apps.items():
             if vis not in valid:
                 raise ValueError(f"privacy.apps.{app!r} must be one of {sorted(valid)}, got {vis!r}")
+        valid_fidelity = {"off", "counts", "structure", "full"}
+        if self.inputs.fidelity not in valid_fidelity:
+            raise ValueError(
+                f"input.fidelity must be one of {sorted(valid_fidelity)}, "
+                f"got {self.inputs.fidelity!r}"
+            )
         if self.observation.poll_interval_seconds <= 0:
             raise ValueError("observation.poll_interval_seconds must be positive")
         if self.observation.idle_threshold_seconds <= 0:
@@ -214,10 +248,40 @@ use_keyring = true
 # firefox = "full"
 # "1password" = "drop"
 
+[input]
+# Keystroke and mouse capture. Needed for stage 4 (replaying a process), and the
+# most sensitive thing Copynion can record. Install with: pip install 'copynion[input]'
+#
+#   "off"       - record nothing            (the default)
+#   "counts"    - how much typing and clicking, nothing about what
+#   "structure" - key *classes*, shortcuts and mouse coordinates: enough to
+#                 recognise a repeated process, not enough to read what you typed
+#   "full"      - literal characters and coordinates: full replay fidelity
+#
+# On macOS, password fields switch on "secure input" and capture is suppressed
+# automatically. Windows and X11 offer no such signal - see docs/PRIVACY.md.
+fidelity = "off"
+
+# Replace emails, numbers, tokens and the like in captured text with
+# placeholders. This is also what you want for *replication*: "type <the invoice
+# number>" generalises across runs, whereas one run's literal value does not.
+redact_typed_text = true
+
+# Mouse movement is decimated to the points that carry information; the position
+# at each click is always kept exactly.
+capture_mouse_moves = true
+move_min_distance = 40.0
+move_max_interval = 0.5
+
+# Hard ceiling per activity span, so a stuck key cannot fill your disk.
+max_events_per_span = 5000
+
 [retention]
 # Delete per-window records older than this. Daily statistics are kept forever;
 # they contain no titles and no free text.
 detail_days = 90
 # Titles expire sooner than the records that carry them.
 title_days = 30
+# Keystrokes and mouse events expire soonest of all.
+input_days = 7
 """

@@ -98,6 +98,26 @@ def render(summary: Summary, *, show_hours: bool = True, top_apps: int = 8) -> s
                 continue
             lines.append(f"  {hour:02d}:00  {human_duration(seconds):>9}  {bar(seconds / peak, 24)}")
 
+    if summary.has_input_data:
+        lines.append(_heading("Interaction"))
+        lines.append(f"  Keystrokes              {summary.keystrokes:>8}  "
+                     f"({summary.keys_per_active_minute:.0f}/active min)")
+        lines.append(f"  Clicks                  {summary.clicks:>8}  "
+                     f"({summary.clicks_per_active_minute:.0f}/active min)")
+        lines.append(f"  Scrolls                 {summary.scrolls:>8}")
+        lines.append(f"  Pointer travelled       {summary.mouse_distance / 1000:>8.1f} k-px")
+        lines.append(
+            f"  Typing vs clicking      {summary.typing_share * 100:>7.0f}%  "
+            f"({_interaction_word(summary.typing_share)})"
+        )
+        if summary.input_by_category:
+            lines.append("\n  By category:")
+            lines.append(f"    {'category':<18} {'keys':>8} {'clicks':>8}")
+            for name, (keys, clicks) in sorted(
+                summary.input_by_category.items(), key=lambda kv: -(kv[1][0] + kv[1][1])
+            )[:8]:
+                lines.append(f"    {name[:18]:<18} {keys:>8} {clicks:>8}")
+
     lines.append(_heading("Repetition signals"))
     lines.append(
         f"  Time in recurring windows  {summary.repetition_share * 100:5.1f}% of active time"
@@ -128,6 +148,16 @@ def render(summary: Summary, *, show_hours: bool = True, top_apps: int = 8) -> s
         "  automation proposals is stage 3."
     )
     return "\n".join(lines)
+
+
+def _interaction_word(typing_share: float) -> str:
+    if typing_share > 0.8:
+        return "almost entirely typing"
+    if typing_share > 0.55:
+        return "typing-led"
+    if typing_share > 0.3:
+        return "mixed"
+    return "navigation-led - the shape automation usually targets"
 
 
 def _fragmentation_word(value: float) -> str:

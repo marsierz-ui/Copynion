@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 
 from copynion.categorize.engine import IDLE_CATEGORY, Categoriser
 from copynion.config import ObservationSettings
+from copynion.inputs.recorder import InputRecorder
 from copynion.models import ActivitySpan, Observation, Visibility
 from copynion.observer.backends.base import WindowBackend
 from copynion.privacy.policy import Policy
@@ -42,6 +43,8 @@ class SamplerStats:
     titles_withheld: int = 0
     redaction_hits: dict[str, int] = field(default_factory=dict)
     backend_failures: int = 0
+    input_events: int = 0
+    input_suppressed: int = 0
 
     def note_redactions(self, hits: dict[str, int]) -> None:
         for name, count in hits.items():
@@ -57,6 +60,8 @@ class SamplerStats:
             "titles_withheld": self.titles_withheld,
             "redaction_hits": dict(self.redaction_hits),
             "backend_failures": self.backend_failures,
+            "input_events": self.input_events,
+            "input_suppressed": self.input_suppressed,
         }
 
 
@@ -73,6 +78,7 @@ class Sampler:
         vault: Vault | None = None,
         categoriser: Categoriser | None = None,
         settings: ObservationSettings | None = None,
+        recorder: InputRecorder | None = None,
         clock=time.time,
     ) -> None:
         self.backend = backend
@@ -82,6 +88,7 @@ class Sampler:
         self.vault = vault or store.vault
         self.categoriser = categoriser or Categoriser(overrides=store.overrides())
         self.settings = settings or ObservationSettings()
+        self.recorder = recorder
         self.clock = clock
         self.stats = SamplerStats()
 
@@ -117,7 +124,12 @@ class Sampler:
         if permitted is None:
             self.stats.dropped_by_policy += 1
             # Close whatever was open: the user's privacy choice ends the span.
-            return self._flush(now)
+            # Flush *before* tightening the interlock - at this moment the
+            # recorder still holds input belonging to the previous, permitted
+            # window, and suppression discards its buffer.
+            flushed = self._flush(now)
+            self._sync_input_interlock(decision, permitted)
+            return flushed
 
         title = ""
         if decision.visibility is Visibility.FULL and permitted.title:
@@ -142,9 +154,30 @@ class Sampler:
                 return flushed
             return None
 
+        # Same ordering rule as above: the open span's input is banked before the
+        # new window's policy can suppress the recorder.
         flushed = self._flush(now)
+        self._sync_input_interlock(decision, permitted)
         self._start(now, permitted, title, title_hash, category, decision.visibility, afk)
         return flushed
+
+    def _sync_input_interlock(self, decision, permitted) -> None:
+        """Keep input capture in step with the window policy.
+
+        Input is at least as sensitive as the title, so it is suppressed
+        whenever the title would be withheld: denied apps, password managers,
+        private-browsing windows and pause. Without this, setting an app to
+        ``app_only`` would hide its titles while still recording every character
+        typed into it - which would make the policy a lie.
+        """
+        if self.recorder is None or not self.recorder.enabled:
+            return
+        # Anything short of FULL visibility means the title is withheld, and
+        # input is strictly more sensitive than a title.
+        if permitted is None or not decision.keeps_title:
+            self.recorder.suppress(f"policy: {decision.reason}")
+        elif self.recorder.suppress_reason.startswith("policy:"):
+            self.recorder.unsuppress()
 
     def _start(self, now, obs, title, title_hash, category, visibility, afk) -> None:
         self._current = ActivitySpan(
@@ -164,6 +197,17 @@ class Sampler:
     def _flush(self, now: float | None = None) -> ActivitySpan | None:
         span = self._current
         self._current, self._current_key = None, None
+
+        # Always close the input batch, even when no span is open. Suppressed
+        # events are counted here, and dropping them on the floor would make
+        # `watch` under-report how much it refused to record - exactly the
+        # number a user needs to trust the interlocks.
+        batch = None
+        if self.recorder is not None and self.recorder.enabled:
+            at = now if now is not None else (span.ended_at if span else self.clock())
+            batch = self.recorder.take_batch(at)
+            self.stats.input_suppressed += batch.counters.suppressed_events
+
         if span is None:
             return None
         if now is not None:
@@ -179,8 +223,12 @@ class Sampler:
             self.stats.spans_too_short += 1
             return None
 
-        self.store.add_span(span)
+        self.store.add_span(span, batch)
         self.stats.spans_written += 1
+        if batch is not None:
+            # Counted after storage, so the number means "events kept", not
+            # "events seen".
+            self.stats.input_events += len(batch.events)
         if span.title and span.visibility is Visibility.FULL:
             if self.vault.can_store_titles:
                 self.stats.titles_stored += 1

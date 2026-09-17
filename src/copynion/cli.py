@@ -22,6 +22,14 @@ from pathlib import Path
 from copynion import __version__
 from copynion.categorize import Categoriser, taxonomy
 from copynion.config import Config, config_dir, data_dir
+from copynion.inputs import Fidelity, InputRecorder, RecorderSettings
+from copynion.inputs.backends import (
+    PynputBackend,
+    detect_input_backend,
+    input_backend_report,
+)
+from copynion.inputs.secure_input import describe as describe_secure_input
+from copynion.inputs.secure_input import is_secure_input_active
 from copynion.models import Visibility
 from copynion.observer.backends import (
     BackendUnavailable,
@@ -30,12 +38,20 @@ from copynion.observer.backends import (
     detect_backend,
 )
 from copynion.observer.sampler import Sampler
-from copynion.privacy import Policy, Redactor, Vault
+from copynion.privacy import Policy, Redactor, Vault, VaultError
 from copynion.runtime import State
 from copynion.stats import human_duration, render, render_compact, summarise
 from copynion.storage import Store
 
 # -- wiring -------------------------------------------------------------------
+
+def _load_config(args) -> Config:
+    """Load config, applying any command-line overrides."""
+    cfg = Config.load(getattr(args, "config", None))
+    if getattr(args, "database", None):
+        cfg.database_override = Path(args.database)
+    return cfg
+
 
 def _build_policy(cfg: Config) -> Policy:
     return Policy(
@@ -53,6 +69,26 @@ def _build_vault(cfg: Config, create: bool = False) -> Vault:
         create=create,
         use_keyring=cfg.privacy.use_keyring,
         allow_unencrypted=cfg.privacy.allow_unencrypted_titles,
+    )
+
+
+def _build_recorder(cfg: Config) -> InputRecorder | None:
+    """Return a recorder, or None when input capture is switched off."""
+    if cfg.inputs.fidelity == Fidelity.OFF.value:
+        return None
+    return InputRecorder(
+        RecorderSettings(
+            fidelity=cfg.inputs.fidelity,
+            redact_typed_text=cfg.inputs.redact_typed_text,
+            capture_mouse_moves=cfg.inputs.capture_mouse_moves,
+            move_min_distance=cfg.inputs.move_min_distance,
+            move_max_interval=cfg.inputs.move_max_interval,
+            max_events_per_span=cfg.inputs.max_events_per_span,
+        ),
+        redactor=Redactor(
+            custom_patterns=cfg.privacy.custom_redaction_patterns,
+            enabled=cfg.privacy.redaction_enabled,
+        ),
     )
 
 
@@ -92,7 +128,7 @@ def _confirm(prompt: str, assume_yes: bool = False) -> bool:
 # -- commands -----------------------------------------------------------------
 
 def cmd_init(args) -> int:
-    cfg = Config.load(args.config) if args.config else Config()
+    cfg = _load_config(args) if args.config else Config()
     config_path = Path(args.config) if args.config else config_dir() / "config.toml"
 
     if config_path.exists() and not args.force:
@@ -127,7 +163,7 @@ def cmd_init(args) -> int:
 
 
 def cmd_watch(args) -> int:
-    cfg = Config.load(args.config)
+    cfg = _load_config(args)
     state = State.load(cfg.state_path)
 
     if state.watcher_running and not args.force:
@@ -143,6 +179,18 @@ def cmd_watch(args) -> int:
 
     store = _open_store(cfg)
     vault = store.vault
+    recorder = _build_recorder(cfg)
+    input_backend = None
+    if recorder is not None:
+        input_backend = detect_input_backend()
+        if input_backend is None:
+            print("Input capture is configured but no input backend is available.")
+            print("  Install it with:  pip install 'copynion[input]'")
+            print("  Continuing with window observation only.\n")
+            recorder = None
+        else:
+            input_backend.start(recorder)
+
     sampler = Sampler(
         backend,
         store,
@@ -154,6 +202,7 @@ def cmd_watch(args) -> int:
         vault=vault,
         categoriser=Categoriser(overrides=store.overrides(), user_rules_path=cfg.rules_path),
         settings=cfg.observation,
+        recorder=recorder,
     )
 
     state.claim_watcher()
@@ -165,6 +214,15 @@ def cmd_watch(args) -> int:
           f"idle after {cfg.observation.idle_threshold_seconds:g}s.")
     print(f"  Default fidelity: {cfg.privacy.default_visibility}. "
           f"Titles encrypted: {vault.available}.")
+    if recorder is not None:
+        print(f"  INPUT CAPTURE IS ON at '{cfg.inputs.fidelity}' fidelity "
+              f"via {input_backend.name}.")
+        if cfg.inputs.fidelity == Fidelity.FULL.value:
+            print("    Literal keystrokes are being recorded"
+                  f"{' (text redacted)' if cfg.inputs.redact_typed_text else ' UNREDACTED'}.")
+        print(f"    Secure input: {describe_secure_input()}")
+    else:
+        print("  Input capture: off")
     print(f"  Data: {cfg.db_path}")
     print("  Pause any time with `copynion pause`. Stop with Ctrl-C.\n")
 
@@ -188,9 +246,13 @@ def cmd_watch(args) -> int:
             if live.paused and not sampler.policy.paused:
                 sampler.policy.pause(live.pause_reason or "user requested")
                 sampler.flush()
+                if recorder is not None:
+                    recorder.suppress("paused")
                 print(f"[{_clock()}] paused ({live.pause_reason or 'user requested'})")
             elif not live.paused and sampler.policy.paused:
                 sampler.policy.resume()
+                if recorder is not None:
+                    recorder.unsuppress()
                 print(f"[{_clock()}] resumed")
 
             sampler.tick()
@@ -200,9 +262,10 @@ def cmd_watch(args) -> int:
             # needing a separate scheduled job.
             if started - last_retention > 3600:
                 removed = store.enforce_retention(
-                    cfg.retention.detail_days, cfg.retention.title_days
+                    cfg.retention.detail_days, cfg.retention.title_days,
+                    cfg.retention.input_days,
                 )
-                if removed["spans"] or removed["titles"]:
+                if any(removed.values()):
                     print(f"[{_clock()}] retention: {removed}")
                 last_retention = started
 
@@ -218,6 +281,8 @@ def cmd_watch(args) -> int:
             stop.wait(max(0.0, cfg.observation.poll_interval_seconds - elapsed))
     finally:
         sampler.flush()
+        if input_backend is not None:
+            input_backend.stop()
         backend.close()
         final = State.load(cfg.state_path)
         final.release_watcher()
@@ -232,6 +297,9 @@ def cmd_watch(args) -> int:
         total = sum(sampler.stats.redaction_hits.values())
         print(f"Redaction removed {total} sensitive fragment(s) before storing: "
               f"{', '.join(sorted(sampler.stats.redaction_hits))}")
+    if sampler.stats.input_events:
+        print(f"Recorded {sampler.stats.input_events} input event batches; "
+              f"{sampler.stats.input_suppressed} event(s) were suppressed by an interlock.")
     if sampler.stats.titles_withheld:
         print(f"{sampler.stats.titles_withheld} title(s) were withheld because "
               "encryption is unavailable.")
@@ -239,7 +307,7 @@ def cmd_watch(args) -> int:
 
 
 def cmd_stop(args) -> int:
-    cfg = Config.load(args.config)
+    cfg = _load_config(args)
     state = State.load(cfg.state_path)
     if not state.watcher_running:
         print("No watcher is running.")
@@ -252,7 +320,7 @@ def cmd_stop(args) -> int:
 
 
 def cmd_status(args) -> int:
-    cfg = Config.load(args.config)
+    cfg = _load_config(args)
     state = State.load(cfg.state_path)
     store = _open_store(cfg)
 
@@ -270,12 +338,19 @@ def cmd_status(args) -> int:
     vault_status = store.vault.status()
     print(f"  Titles:    {'encrypted' if vault_status['encryption_active'] else 'NOT stored (fail-closed)'}")
     print(f"  Fidelity:  {cfg.privacy.default_visibility} by default")
-    print(f"  Retention: {cfg.retention.detail_days}d detail, {cfg.retention.title_days}d titles")
+    if cfg.inputs.fidelity == Fidelity.OFF.value:
+        print("  Input:     off")
+    else:
+        print(f"  Input:     {cfg.inputs.fidelity.upper()}"
+              f"{' (text redacted)' if cfg.inputs.redact_typed_text else ' (UNREDACTED)'}")
+    print(f"  Retention: {cfg.retention.detail_days}d detail, "
+          f"{cfg.retention.title_days}d titles, {cfg.retention.input_days}d input")
     print(f"  Database:  {cfg.db_path}")
 
     counts = store.counts()
     print(f"  Stored:    {counts['spans']} spans over {counts['rollup_days']} day(s), "
-          f"{counts['titles']} titles, {counts['overrides']} user labels")
+          f"{counts['titles']} titles, {counts['input_batches']} input batches, "
+          f"{counts['overrides']} user labels")
 
     start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
     today = summarise(store.spans(since=start))
@@ -285,7 +360,7 @@ def cmd_status(args) -> int:
 
 
 def cmd_stats(args) -> int:
-    cfg = Config.load(args.config)
+    cfg = _load_config(args)
     store = _open_store(cfg)
     since, until = _period(args)
     summary = summarise(
@@ -304,15 +379,20 @@ def cmd_stats(args) -> int:
 
 def cmd_demo(args) -> int:
     """Populate a throwaway database with a synthetic week and show the report."""
-    from copynion.demo import generate_week
+    import random
+
+    from copynion.demo import generate_week, synthesise_input
 
     path = Path(args.database) if args.database else data_dir() / "demo.db"
     if path.exists() and not args.keep:
         path.unlink()
 
-    vault = Vault(Vault.generate_key())
+    # Use the configured vault, not a throwaway key: the demo database is
+    # synthetic, but it must still be readable afterwards by `copynion replay`,
+    # which opens it with the real key.
+    cfg = _load_config(args)
+    vault = _build_vault(cfg, create=True)
     store = Store(path, vault)
-    cfg = Config()
     cfg.observation.min_span_seconds = 30
 
     # The demo opts every app into full fidelity: it is fabricated data, and the
@@ -321,6 +401,10 @@ def cmd_demo(args) -> int:
         ["code", "firefox", "localc", "thunderbird", "alacritty", "slack", "zoom", "nautilus"],
         "full",
     )
+    recorder = None
+    if args.input != Fidelity.OFF.value:
+        recorder = InputRecorder(RecorderSettings(fidelity=args.input), redactor=Redactor())
+
     sampler = Sampler(
         FakeBackend([]),
         store,
@@ -328,22 +412,34 @@ def cmd_demo(args) -> int:
         redactor=Redactor(),
         vault=vault,
         settings=cfg.observation,
+        recorder=recorder,
     )
     observations = generate_week(days=args.days)
+    rng = random.Random(11)
     for obs in observations:
         sampler.ingest(obs)
+        if recorder is not None:
+            synthesise_input(obs, recorder, rng)
     sampler._flush(observations[-1].timestamp)
 
+    counts = store.counts()
     print(f"Generated {len(observations)} synthetic samples over {args.days} day(s) "
-          f"-> {store.counts()['spans']} spans.\n")
+          f"-> {counts['spans']} spans.")
+    if recorder is not None:
+        print(f"Synthetic interaction recorded at '{args.input}' fidelity "
+              f"into {counts['input_batches']} batches.")
+    print()
     print(render(summarise(store.spans())))
     print(f"\n(Demo database: {path} - delete it whenever you like.)")
+    if recorder is not None:
+        print(f"Inspect the captured interaction with:"
+              f"\n    copynion --database {path} replay")
     store.close()
     return 0
 
 
 def cmd_doctor(args) -> int:
-    cfg = Config.load(args.config)
+    cfg = _load_config(args)
     problems: list[str] = []
     notes: list[str] = []
 
@@ -375,6 +471,37 @@ def cmd_doctor(args) -> int:
             notes.append("Titles are not stored at all until encryption is available.")
     if not cfg.privacy.redaction_enabled:
         problems.append("Redaction is disabled; titles will be stored as-is.")
+
+    print("\nInput capture")
+    print(f"  fidelity .................. {cfg.inputs.fidelity}")
+    if cfg.inputs.fidelity != Fidelity.OFF.value:
+        for entry in input_backend_report():
+            mark = "ok " if entry["available"] else "-- "
+            print(f"  [{mark}] {entry['name']:<8} {entry['state']}")
+        print(f"  typed text redacted ....... "
+              f"{'yes' if cfg.inputs.redact_typed_text else 'NO'}")
+        print(f"  secure input .............. {describe_secure_input()}")
+        print(f"  input retention ........... {cfg.retention.input_days} days")
+        if detect_input_backend() is None:
+            problems.append(
+                "Input capture is configured but unavailable: "
+                + PynputBackend.describe_state()
+            )
+        if cfg.inputs.fidelity == Fidelity.FULL.value:
+            notes.append(
+                "Input fidelity is 'full': literal keystrokes are recorded"
+                + ("." if cfg.inputs.redact_typed_text else ", UNREDACTED.")
+            )
+            if not cfg.inputs.redact_typed_text:
+                problems.append(
+                    "input.redact_typed_text is false - everything you type is "
+                    "stored verbatim (encrypted, but verbatim)."
+                )
+            if is_secure_input_active() is None:
+                notes.append(
+                    "This platform cannot signal password fields, so input "
+                    "capture relies on the application policy alone."
+                )
 
     print("\nFiles")
     for label, path in (
@@ -408,7 +535,7 @@ def cmd_doctor(args) -> int:
 
 
 def cmd_pause(args) -> int:
-    cfg = Config.load(args.config)
+    cfg = _load_config(args)
     state = State.load(cfg.state_path)
     state.paused = True
     state.pause_reason = args.reason or "user requested"
@@ -427,7 +554,7 @@ def cmd_pause(args) -> int:
 
 
 def cmd_resume(args) -> int:
-    cfg = Config.load(args.config)
+    cfg = _load_config(args)
     state = State.load(cfg.state_path)
     if not state.paused:
         print("Recording is not paused.")
@@ -445,7 +572,7 @@ def cmd_resume(args) -> int:
 
 
 def cmd_rules(args) -> int:
-    cfg = Config.load(args.config)
+    cfg = _load_config(args)
     store = _open_store(cfg)
     engine = Categoriser(overrides=store.overrides(), user_rules_path=cfg.rules_path)
 
@@ -492,7 +619,7 @@ def cmd_rules(args) -> int:
 
 def cmd_label(args) -> int:
     """Correct a categorisation. User labels outrank every rule, permanently."""
-    cfg = Config.load(args.config)
+    cfg = _load_config(args)
     if args.category not in taxonomy.VALID_CATEGORIES:
         print(f"Unknown category {args.category!r}. Valid categories:")
         print("  " + ", ".join(sorted(taxonomy.VALID_CATEGORIES)))
@@ -509,7 +636,7 @@ def cmd_label(args) -> int:
 
 
 def cmd_export(args) -> int:
-    cfg = Config.load(args.config)
+    cfg = _load_config(args)
     store = _open_store(cfg)
     since, until = _period(args)
     records = list(store.export(include_titles=args.include_titles, since=since))
@@ -556,7 +683,7 @@ def cmd_export(args) -> int:
 
 
 def cmd_purge(args) -> int:
-    cfg = Config.load(args.config)
+    cfg = _load_config(args)
     store = _open_store(cfg)
 
     if args.titles_only:
@@ -573,9 +700,28 @@ def cmd_purge(args) -> int:
         store.close()
         return 0
 
+    if args.inputs_only:
+        count = store.counts()["input_batches"]
+        if not count:
+            print("No recorded input to delete.")
+            store.close()
+            return 0
+        if not _confirm(
+            f"Delete all {count} recorded input batches "
+            "(keystrokes and mouse events)? Counts and statistics are kept.",
+            args.yes,
+        ):
+            print("Cancelled.")
+            store.close()
+            return 1
+        print(f"Deleted {store.forget_inputs()} input batch(es).")
+        store.close()
+        return 0
+
     if args.all:
         counts = store.counts()
         print(f"This deletes EVERYTHING: {counts['spans']} spans, {counts['titles']} titles,")
+        print(f"{counts['input_batches']} recorded input batches,")
         print(f"and all daily statistics across {counts['rollup_days']} day(s).")
         print("It cannot be undone.")
         if not _confirm("Delete all recorded data?", args.yes):
@@ -593,7 +739,8 @@ def cmd_purge(args) -> int:
     if args.after:
         after = datetime.strptime(args.after, "%Y-%m-%d").timestamp()
     if not any([before, after, args.app]):
-        print("Nothing specified. Use --before, --after, --app, --titles-only or --all.")
+        print("Nothing specified. Use --before, --after, --app, --titles-only, "
+              "--inputs-only or --all.")
         store.close()
         return 1
 
@@ -615,8 +762,95 @@ def cmd_purge(args) -> int:
     return 0
 
 
+def cmd_replay(args) -> int:
+    """Show the recorded interaction for a span, step by step.
+
+    This is stage 4's raw material, printed rather than executed. Copynion
+    cannot yet perform these actions, and being able to read exactly what was
+    captured is the honest way to decide whether you want it recorded at all.
+    """
+    cfg = _load_config(args)
+    store = _open_store(cfg)
+
+    if args.span is None:
+        rows = [r for r in store.spans() if r["keystrokes"] or r["clicks"]]
+        if not rows:
+            print("No spans with recorded input. Is [input] fidelity switched on?")
+            store.close()
+            return 1
+        print("Spans with recorded input:\n")
+        print(f"  {'id':>6}  {'when':<17} {'app':<16} {'keys':>6} {'clicks':>7}")
+        for row in rows[-args.limit:]:
+            when = datetime.fromtimestamp(row["started_at"]).strftime("%Y-%m-%d %H:%M")
+            print(f"  {row['id']:>6}  {when:<17} {row['app'][:16]:<16} "
+                  f"{row['keystrokes']:>6} {row['clicks']:>7}")
+        print("\nShow one with:  copynion replay --span <id>")
+        store.close()
+        return 0
+
+    row = next((r for r in store.spans() if r["id"] == args.span), None)
+    if row is None:
+        print(f"No span with id {args.span}.")
+        store.close()
+        return 1
+
+    batch = store.inputs_of(args.span)
+    if batch is None:
+        print(f"Span {args.span} has no stored input "
+              "(capture was off, or the input retention window has passed).")
+        store.close()
+        return 1
+
+    title = store.title_of(args.span)
+    when = datetime.fromtimestamp(row["started_at"]).strftime("%Y-%m-%d %H:%M:%S")
+    print(f"Span {args.span}: {row['app']} - {title or '(title not recorded)'}")
+    print(f"  {when}, {human_duration(row['duration'])}, "
+          f"category {row['category']}, fidelity {batch.fidelity}\n")
+
+    if args.json:
+        print(json.dumps(batch.to_dict(), indent=2))
+        store.close()
+        return 0
+
+    origin = batch.events[0].at if batch.events else row["started_at"]
+    for event in batch.events:
+        offset = event.at - origin
+        print(f"  +{offset:7.2f}s  {_describe_event(event)}")
+
+    counters = batch.counters.to_dict()
+    print(f"\n  {counters['keystrokes']} keystrokes, {counters['clicks']} clicks, "
+          f"{counters['scrolls']} scrolls, "
+          f"{counters['mouse_distance']:.0f}px of pointer travel")
+    if counters["suppressed_events"]:
+        print(f"  {counters['suppressed_events']} event(s) suppressed by an interlock.")
+    print("\n  Replaying these actions is stage 4 and is not implemented.")
+    store.close()
+    return 0
+
+
+def _describe_event(event) -> str:
+    """One human-readable line per recorded interaction."""
+    if event.kind == "key":
+        if event.text is not None:
+            return f"type       {event.text!r}" + (
+                f"  ({event.count} chars)" if event.count and event.count > 1 else ""
+            )
+        count = f" x{event.count}" if event.count and event.count > 1 else ""
+        return f"key        <{event.key_class}>{count}"
+    if event.kind == "shortcut":
+        return f"shortcut   {event.combo}"
+    if event.kind == "click":
+        multi = f" x{event.count}" if event.count and event.count > 1 else ""
+        return f"click      {event.button} at ({event.x}, {event.y}){multi}"
+    if event.kind == "scroll":
+        return f"scroll     ({event.dx:+d}, {event.dy:+d}) at ({event.x}, {event.y})"
+    if event.kind == "move":
+        return f"move       -> ({event.x}, {event.y})"
+    return f"{event.kind}"
+
+
 def cmd_audit(args) -> int:
-    cfg = Config.load(args.config)
+    cfg = _load_config(args)
     store = _open_store(cfg)
     entries = store.audit_entries(args.limit)
     if not entries:
@@ -642,6 +876,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=f"copynion {__version__}")
     parser.add_argument("--config", type=Path, help="path to config.toml")
+    parser.add_argument("--database", type=Path,
+                        help="use this database instead of the configured one")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("init", help="create the config, key and database")
@@ -671,7 +907,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("demo", help="generate a synthetic week and show the report")
     p.add_argument("--days", type=int, default=5)
-    p.add_argument("--database", help="where to put the demo database")
+    # Note: the database location comes from the global --database option, so
+    # that `copynion --database X demo` and `copynion --database X replay` refer
+    # to the same file.
+    p.add_argument("--input", choices=["off", "counts", "structure", "full"], default="full",
+                   help="fidelity for the synthetic interaction (default: full - it is "
+                        "fabricated data, so this shows what full capture looks like)")
     p.add_argument("--keep", action="store_true", help="append to an existing demo database")
     p.set_defaults(func=cmd_demo)
 
@@ -714,11 +955,19 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("purge", help="delete recorded data")
     p.add_argument("--all", action="store_true", help="delete everything")
     p.add_argument("--titles-only", action="store_true", help="delete titles, keep statistics")
+    p.add_argument("--inputs-only", action="store_true",
+                   help="delete recorded keystrokes and mouse events, keep everything else")
     p.add_argument("--before", help="delete data before YYYY-MM-DD")
     p.add_argument("--after", help="delete data after YYYY-MM-DD")
     p.add_argument("--app", help="delete data for one application")
     p.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
     p.set_defaults(func=cmd_purge)
+
+    p = sub.add_parser("replay", help="show the interaction recorded for a span")
+    p.add_argument("--span", type=int, help="span id; omit to list spans with input")
+    p.add_argument("--limit", type=int, default=20, help="how many spans to list")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_replay)
 
     p = sub.add_parser("audit", help="show the log of privacy-relevant actions")
     p.add_argument("--limit", type=int, default=30)
@@ -734,6 +983,16 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("\nInterrupted.")
         return 130
+    except VaultError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        print(
+            "\nThis usually means the database was written with a different "
+            "encryption key\nthan the one available now. Check `copynion doctor`, "
+            "and note that a key\nstored in a file rather than the OS keychain does "
+            "not follow you to another machine.",
+            file=sys.stderr,
+        )
+        return 1
     except (ValueError, OSError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1

@@ -164,3 +164,76 @@ time-tracking features.
 The project is worth continuing if, and only if, stage 3 can demonstrate that
 metadata-only observation finds real automation candidates. That is the
 experiment, and it should be run before building anything more.
+
+---
+
+## Should Copynion use ActivityWatch as its observation layer?
+
+A fair question, since [ActivityWatch](https://activitywatch.net/) already does
+local-first window tracking well and is the closest prior art. The answer is
+**build our own observation layer, but be import-compatible with theirs** — for
+four concrete reasons, not for pride of authorship.
+
+### 1. Its architecture conflicts with the central privacy guarantee
+
+ActivityWatch is a local *server* (`aw-server`, listening on `localhost:5600`)
+that watchers post events to over HTTP. Its
+[documented security model](https://docs.activitywatch.net/en/latest/api/rest.html)
+is essentially "only accepts non-localhost connections... is likely to be the
+case for quite a while" — fine for a personal time tracker.
+
+But Copynion's strongest guarantee is that it contains **no network client at
+all**, enforced by `tests/test_no_network.py`, which fails the build if any
+source file imports a socket stack. Consuming an HTTP API would require
+importing exactly those modules. We would have to delete the test that makes
+the guarantee real, and replace "there is no code that can send your data
+anywhere" with "there is an HTTP server on your machine holding all of it, and
+any local process can read it". That is a materially weaker promise, and it is
+the promise the whole project rests on.
+
+### 2. It does not capture what stage 4 needs
+
+ActivityWatch records window titles and AFK state. It does not capture
+keystrokes or mouse events, and by design it is not going to — it is a time
+tracker. Since process replication needs exactly that (see
+[PRIVACY.md](PRIVACY.md#input-capture)), the input layer would have to be built
+here regardless. Adopting ActivityWatch would mean maintaining *both* its
+integration and our own input capture, for a subset of what we need.
+
+### 3. Its data model has nowhere to put the privacy metadata
+
+Every Copynion span carries a visibility tier, a redaction outcome, a sealed
+title and a keyed fingerprint. ActivityWatch's bucket/event model has no
+concept of any of these, so they would live in a side table keyed by event id —
+at which point we own a database anyway, plus a synchronisation problem between
+two stores with different retention rules.
+
+### 4. Its categorisation is weaker than what stage 3 needs
+
+Categorisation offers
+[only "Regex" or "No rule"](https://docs.activitywatch.net/en/latest/features/categorization.html),
+matched against `app` and `title`, and
+[URL matching is unsupported](https://github.com/ActivityWatch/activitywatch/issues/352).
+Copynion already needs rule precedence, user overrides that outrank rules
+permanently, and per-span provenance (`rule_id`) so a classification can be
+explained. That is a different engine, not a configuration of theirs.
+
+### What we should take instead
+
+- **An importer.** `copynion import activitywatch <export.json>` would let
+  someone arrive with months of history already collected. This is cheap, high
+  value, and on the roadmap.
+- **Its watcher decomposition.** Separating observation from storage is the
+  right shape, and Copynion's `WindowBackend` is a deliberately smaller version
+  of the same idea.
+- **Its platform know-how.** The hard-won details of reading the active window
+  on each OS are worth learning from; it is a mature, open codebase.
+
+### The honest counter-argument
+
+If Copynion's privacy model were relaxed to ActivityWatch's — a localhost HTTP
+server, plaintext titles — then building on it would be the obviously correct
+engineering decision, and would save months. The case for our own layer rests
+entirely on the stricter guarantees being worth that cost. If those guarantees
+are ever quietly dropped, this decision should be revisited rather than
+defended.

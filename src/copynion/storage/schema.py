@@ -12,11 +12,16 @@ Two tiers of data live here, and the distinction drives the retention policy:
     trends are built from, so the detailed tier can be purged aggressively
     without losing the user's history.
 
-``span_titles`` is a separate table from ``spans`` so that "forget all titles but
-keep my statistics" is a single DELETE rather than a schema migration.
+``span_titles`` and ``span_inputs`` are separate tables from ``spans`` so that
+"forget all titles but keep my statistics", or "forget everything I typed", is a
+single DELETE rather than a schema migration.
+
+Input *counters* live on ``spans`` as plaintext columns because they contain no
+content at all - a number of keystrokes is not a keystroke. The events
+themselves live sealed in ``span_inputs`` and expire far sooner.
 """
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 PRAGMA journal_mode = WAL;
@@ -43,7 +48,12 @@ CREATE TABLE IF NOT EXISTS spans (
     afk          INTEGER NOT NULL DEFAULT 0,
     visibility   TEXT    NOT NULL DEFAULT 'app_only',
     sample_count INTEGER NOT NULL DEFAULT 1,
-    backend      TEXT    NOT NULL DEFAULT 'unknown'
+    backend      TEXT    NOT NULL DEFAULT 'unknown',
+    -- Content-free input aggregates, safe to keep in plaintext.
+    keystrokes     INTEGER NOT NULL DEFAULT 0,
+    clicks         INTEGER NOT NULL DEFAULT 0,
+    scrolls        INTEGER NOT NULL DEFAULT 0,
+    mouse_distance REAL    NOT NULL DEFAULT 0.0
 );
 
 CREATE INDEX IF NOT EXISTS idx_spans_day       ON spans(day);
@@ -56,6 +66,15 @@ CREATE INDEX IF NOT EXISTS idx_spans_hash      ON spans(title_hash);
 CREATE TABLE IF NOT EXISTS span_titles (
     span_id INTEGER PRIMARY KEY REFERENCES spans(id) ON DELETE CASCADE,
     sealed  BLOB NOT NULL
+);
+
+-- Recorded keystrokes and mouse events, compressed then sealed. This is the
+-- most sensitive table in the database and has the shortest retention.
+CREATE TABLE IF NOT EXISTS span_inputs (
+    span_id     INTEGER PRIMARY KEY REFERENCES spans(id) ON DELETE CASCADE,
+    sealed      BLOB    NOT NULL,
+    event_count INTEGER NOT NULL DEFAULT 0,
+    fidelity    TEXT    NOT NULL DEFAULT 'off'
 );
 
 -- Tier 2: aggregated, non-sensitive, kept indefinitely.
@@ -98,3 +117,22 @@ CREATE TABLE IF NOT EXISTS audit_log (
     detail    TEXT NOT NULL DEFAULT ''
 );
 """
+
+
+#: Incremental upgrades for databases created by an older version. Applied in
+#: order for anything below SCHEMA_VERSION; a freshly created database gets the
+#: full SCHEMA above and skips these entirely.
+MIGRATIONS: dict[int, list[str]] = {
+    2: [
+        "ALTER TABLE spans ADD COLUMN keystrokes INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE spans ADD COLUMN clicks INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE spans ADD COLUMN scrolls INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE spans ADD COLUMN mouse_distance REAL NOT NULL DEFAULT 0.0",
+        """CREATE TABLE IF NOT EXISTS span_inputs (
+               span_id     INTEGER PRIMARY KEY REFERENCES spans(id) ON DELETE CASCADE,
+               sealed      BLOB    NOT NULL,
+               event_count INTEGER NOT NULL DEFAULT 0,
+               fidelity    TEXT    NOT NULL DEFAULT 'off'
+           )""",
+    ],
+}

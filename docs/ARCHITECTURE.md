@@ -56,12 +56,47 @@ sealing. See [PRIVACY.md](PRIVACY.md) for why each of those matters.
 | `privacy/policy.py` | Fidelity decisions, denylists, private-browsing detection |
 | `privacy/redact.py` | Pattern-based scrubbing of titles |
 | `privacy/vault.py` | Key management, AES-GCM sealing, keyed fingerprints |
+| `inputs/events.py` | Input event types, fidelity tiers, key classification |
+| `inputs/recorder.py` | Tiering, coalescing, decimation, interlocks — all pure, all testable |
+| `inputs/secure_input.py` | Password-field detection (macOS only; honest about the rest) |
+| `inputs/backends/` | Global input hooks via `pynput`, plus a scriptable fake |
 | `storage/schema.py` | Two-tier schema: detailed spans vs. durable rollups |
 | `storage/store.py` | All reads and writes, retention, purge, export, audit log |
 | `categorize/` | Taxonomy, JSON rule pack, matching engine |
 | `stats/` | Aggregation and text rendering |
 | `demo.py` | Synthetic week, so the pipeline is demonstrable with no real data |
 | `cli.py` | Commands |
+
+## The input pipeline
+
+When input capture is enabled, a second stream runs alongside the window
+sampler and is attached to whichever span was open when it happened:
+
+```
+  keyboard / mouse hook (pynput)
+         |
+    [1] Interlocks   -- secure input? denied app? paused?  -> discard buffer
+         |
+    [2] Tiering      -- counts / structure / full
+         |
+    [3] Coalescing   -- a run of printable keys becomes one event;
+                        mouse movement decimated, clicks never
+         |
+    [4] Redaction    -- typed text through the same scrubber as titles
+         |
+    [5] Batch        -- sorted chronologically, zlib, AES-GCM, one blob per span
+```
+
+Two ordering rules here are load-bearing and each has a regression test:
+
+- **The batch is banked before the interlock tightens.** When focus moves to a
+  denied application, the recorder still holds input belonging to the
+  *previous*, permitted window — and suppression discards its buffer. So
+  `Sampler.ingest()` flushes the span first, then applies the new policy.
+- **Events are sorted on the way out.** A coalesced run of printable keys
+  carries the timestamp of its *first* key but is appended when the run ends,
+  so it can otherwise land after events that happened during it. Replay depends
+  on chronological order.
 
 ## Key design decisions
 
@@ -93,7 +128,12 @@ it call this work?" is answerable by pointing at a line.
 every rule forever. Stage 3 will learn from these, so they must never be
 silently overwritten by a rule-pack update.
 
-**Fail closed, everywhere.** No encryption key means no stored titles. A broken
+**Input is never more permissive than titles.** Any app whose title the policy
+withholds records no input either. Marking an app `app_only` while still logging
+every character typed into it would make the policy meaningless.
+
+**Fail closed, everywhere.** No encryption key means no stored titles, and no
+stored input. A broken
 `cryptography` install means no stored titles. An unknown config key is an
 error, not a silent ignore — because silently ignoring `redaction_enable` (note
 the typo) would silently disable redaction.
@@ -104,9 +144,11 @@ three-day suspend does not become a three-day work session (`_max_extension`).
 
 ## Testing strategy
 
-168 tests, no network, no display server required — the `FakeBackend` and
+239 tests, no network, no display server required — the `FakeBackend`, `FakeInputBackend` and
 synthetic clocks mean the entire pipeline is testable headless, which is where
-CI runs.
+CI runs. Input capture in particular gets the most paranoid tests in the suite,
+since it is the subsystem least testable against a real OS hook and the one
+where a plausible-looking refactor does the most damage.
 
 The one architectural test is `tests/test_no_network.py`: it parses every source
 file's AST and fails the build if any networking module is imported anywhere.

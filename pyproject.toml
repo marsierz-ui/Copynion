@@ -29,7 +29,11 @@ dependencies = []
 crypto = ["cryptography>=41"]
 # Stores the vault key in the OS keychain instead of a 0600 file.
 keyring = ["keyring>=24"]
+# Global keyboard and mouse capture (stage 4 groundwork). Opt-in by design:
+# without it, input fidelity simply stays off and everything else still works.
+input = ["pynput>=1.7"]
 dev = ["pytest>=7.4", "ruff>=0.4"]
+all = ["cryptography>=41", "keyring>=24", "pynput>=1.7"]
 
 [project.scripts]
 copynion = "copynion.cli:main"

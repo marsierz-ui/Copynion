@@ -23,6 +23,8 @@ Everything Copynion stores, and how sensitive it is:
 | Window title | AES-GCM ciphertext, **redacted first** | **high** | 30 days |
 | Title fingerprint | keyed HMAC-SHA256, truncated | low (not reversible) | 90 days |
 | Category, rule id, confidence | plaintext columns | low | 90 days |
+| Input counters (keystrokes, clicks, scrolls, pointer distance) | plaintext columns | low (no content) | 90 days |
+| Recorded keystrokes / mouse events | zlib + AES-GCM, **redacted first** | **highest** | **7 days**, off by default |
 | Daily rollups (per day/app/category seconds) | plaintext, no free text | low | **kept indefinitely** |
 | App-to-app transition counts | plaintext, no free text | low | kept indefinitely |
 | Your category corrections | plaintext | low | kept until you delete them |
@@ -30,7 +32,6 @@ Everything Copynion stores, and how sensitive it is:
 
 Explicitly **never collected**, at any stage or setting:
 
-- keystrokes, or any keyboard content
 - clipboard contents
 - screenshots, screen recording, or OCR of the screen
 - file contents
@@ -38,6 +39,10 @@ Explicitly **never collected**, at any stage or setting:
 - microphone or camera
 - network traffic
 - anything about other users on the machine
+
+**Keystrokes and mouse events are collected only if you switch them on.** They
+are off by default, they have their own section below, and they are the reason
+the rest of this document exists.
 
 Stage 4 (execution) will eventually need to *act*, which is a different
 capability with a different consent model. It is not implemented, and it will
@@ -143,6 +148,132 @@ Two tiers, which is what makes aggressive retention painless:
 So you keep years of "how much time did I spend on data entry in Q2?" while the
 per-window detail of any given Tuesday has long since been deleted.
 
+## Input capture
+
+Replicating a process requires knowing what was typed and clicked, not merely
+that typing happened. That is a real requirement for stage 4, and Copynion
+serves it — but keystroke content is the single most dangerous thing a program
+on your computer can record. It captures passwords, two-factor codes, private
+messages and everything else, and unlike a window title there is no version of
+it that is safe to collect by default.
+
+So it is **off unless you switch it on**, and it is switched on at a *tier*.
+
+### The four tiers
+
+Set `[input] fidelity` in your config:
+
+| Tier | Records | Can replay a process? |
+|------|---------|-----------------------|
+| `off` | nothing — **the default** | no |
+| `counts` | how much typing and clicking, nothing about what | no |
+| `structure` | key *classes*, shortcut combinations, mouse coordinates and timing | approximately |
+| `full` | literal characters, coordinates and timing | yes |
+
+`structure` is the tier worth understanding. It records that you typed twelve
+printable characters, then Tab, then Ctrl+C, then clicked at (412, 380) — enough
+to recognise the same process next time and to measure how often you do it, but
+not enough to read what you wrote. For *finding* automatable work that is
+usually sufficient; only actually performing it needs `full`.
+
+Shortcut combinations (Ctrl+C, Ctrl+V, Alt+Tab) are recorded literally from
+`structure` upward. They are not secret, and a copy-paste loop is precisely the
+kind of repetition worth automating.
+
+### Typed text is redacted by default — and that is the better default for replay
+
+At `full` fidelity, runs of typed characters pass through the same redactor as
+window titles before being stored, so typing `invoice 4455667788 for
+bob@acme.com` is stored as `invoice <number> for <email>`.
+
+This is a privacy measure, but it is also the **right answer for process
+replication**, which is worth stating because it looks like a limitation. A
+process you repeat is not the same data every time: each run has a different
+invoice number, a different customer, a different date. What generalises is the
+*slot* — "type the invoice number here" — not one run's value. Redaction
+identifies those slots automatically. Storing literals would capture one
+instance and a great deal of exposure.
+
+If you genuinely need verbatim replay of constant text, set
+`redact_typed_text = false`. `copynion doctor` will report that as a problem for
+as long as it is set, because everything you type will then be stored verbatim
+(encrypted, but verbatim).
+
+### Interlocks that configuration cannot switch off
+
+Input recording is suppressed, whatever the tier:
+
+- **When a password field has focus**, on platforms that can say so. macOS
+  applications enable *secure event input* for password fields and
+  `IsSecureEventInputEnabled()` reports it; Copynion re-checks on **every
+  event**, not on a timer, because a field can gain focus between two
+  keystrokes and those are exactly the keystrokes that must not be kept.
+- **For any application whose title the policy would withhold.** Input is
+  strictly more sensitive than a title, so an app set to `app_only`, `opaque` or
+  `drop` records no input either. Without this rule, marking an app `app_only`
+  would hide its titles while still recording every character typed into it,
+  which would make the whole policy a lie.
+- **During private browsing**, and **while paused**.
+
+When suppression begins, any partially typed word is **discarded, not
+committed** — if we learn mid-word that this is a password field, the fragment
+must not survive. The number of suppressed events is counted (not their
+content), so `copynion watch` can tell you honestly how much it refused to
+record.
+
+### Volume, storage and retention
+
+Mouse movement is decimated to the points that carry information: a new point
+when the pointer has travelled far enough or enough time has passed. **The
+position at each click is never decimated**, because that is the coordinate
+replay actually needs. Total distance accrues exactly regardless.
+
+Each span's events are serialised, zlib-compressed, then sealed with AES-GCM as
+a single blob — one row per span rather than one per keystroke. A million-row
+table of individual key events would be both slow and a far more inviting
+target. There is a hard per-span event cap so a stuck key cannot fill the disk.
+
+Recorded input expires **after 7 days** by default — sooner than titles (30) and
+spans (90). Its value for spotting repeated processes is concentrated in the
+recent past; its risk is not.
+
+Content-free counters (how many keystrokes, clicks, scrolls, pointer distance)
+live in plaintext columns on the span and survive that expiry, so the
+interaction statistics keep working long after the events themselves are gone.
+
+### Seeing exactly what was recorded
+
+```bash
+copynion replay                 # spans that have recorded input
+copynion replay --span 412      # the full interaction, step by step
+copynion purge --inputs-only    # delete it all, keep the statistics
+```
+
+`replay` prints the trace rather than performing it — Copynion cannot execute
+anything yet. Being able to read precisely what was captured is the honest way
+to decide whether you want it captured at all, so try it on `copynion demo`
+(which generates synthetic interaction) before enabling it for real.
+
+### Platform reality
+
+Input capture needs `pip install 'copynion[input]'`, which pulls in `pynput`.
+This is the one real third-party dependency in the project and it is optional.
+
+| Platform | Capture | Password-field detection |
+|----------|---------|--------------------------|
+| macOS | needs Accessibility **and** Input Monitoring permission | **yes** — secure event input |
+| Windows | works | **no** — relies on app policy alone |
+| Linux/X11 | works, no special permission | **no** — relies on app policy alone |
+| Linux/Wayland | generally blocked by the compositor | n/a |
+
+**Be clear about the middle rows.** On Windows and X11 there is no way for an
+ordinary process to know a password field has focus. If you enable `full`
+fidelity there, a password typed into a web form is in principle capturable —
+redaction will not catch it, because a password does not look like anything in
+particular. The mitigations are the app policy (password managers are denied by
+default), your own `title_denylist`, and the 7-day expiry. If that is not
+acceptable to you, use `structure`, which never records characters at all.
+
 ## Your data is yours
 
 ```bash
@@ -150,6 +281,7 @@ copynion export                      # JSON, no titles
 copynion export --format csv -o f.csv
 copynion export --include-titles     # decrypts; warns you on stderr
 copynion purge --titles-only         # forget every title, keep statistics
+copynion purge --inputs-only         # forget every keystroke, keep the counts
 copynion purge --app slack           # forget one application
 copynion purge --before 2026-01-01
 copynion purge --all                 # everything, unrecoverably
@@ -173,6 +305,14 @@ Claims in a README are worth nothing; these are enforced in the test suite.
 - `test_default_policy_withholds_titles` pins the conservative default.
 - `test_titles_are_redacted_before_they_are_sealed` pins the pipeline ordering.
 - `test_purge_refuses_without_confirmation_when_not_a_tty` pins the guard rails.
+- `test_recorded_input_is_not_readable_in_the_raw_database` types a passphrase,
+  stores it, then greps the database file for it.
+- `test_suppression_discards_the_partial_buffer` pins the "drop the half-typed
+  word" rule.
+- `test_app_only_visibility_also_suppresses_input` pins the rule that input
+  never outlives the policy hiding the window's title.
+- `test_counts_records_totals_but_no_content` and
+  `test_structure_records_classes_but_not_characters` pin the tier boundaries.
 
 ## Limits — what this does *not* protect you against
 
@@ -202,6 +342,15 @@ marketing.
    Copynion does not do that. It records the time as `opaque` and tells you in
    `doctor`. This is an honest limitation, not a missing feature.
 7. **Copynion does not encrypt its own statistics.** Rollups are plaintext.
+8. **Input capture at `full` fidelity is a keylogger you have pointed at
+   yourself.** The tiers, interlocks, redaction and short retention are real
+   mitigations and they are tested, but they do not change that fact. On
+   Windows and X11 there is no password-field signal to rely on. Enable it
+   deliberately, prefer `structure` unless you specifically need replay, and
+   read `copynion replay` output before deciding to leave it on.
+9. **Input counters outlive input events.** After the 7-day expiry, "you typed
+   14,000 characters in the spreadsheet on Tuesday" remains. That is
+   content-free but not information-free.
 
 ## If you are considering this for employees
 

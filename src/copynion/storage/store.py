@@ -11,13 +11,15 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+import zlib
 from collections.abc import Iterable, Iterator
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from copynion.inputs.events import InputBatch, InputCounters
 from copynion.models import ActivitySpan, Category, Visibility
 from copynion.privacy.vault import Vault
-from copynion.storage.schema import SCHEMA, SCHEMA_VERSION
+from copynion.storage.schema import MIGRATIONS, SCHEMA, SCHEMA_VERSION
 
 
 def day_of(timestamp: float) -> str:
@@ -41,10 +43,13 @@ class Store:
         new_file = not self.path.exists()
         self.conn = sqlite3.connect(str(self.path), isolation_level=None)
         self.conn.row_factory = sqlite3.Row
+        existing_version = self._existing_version()
         self.conn.executescript(SCHEMA)
         if new_file:
             # Owner-only, from the moment the file exists.
             self.path.chmod(0o600)
+        if existing_version is not None and existing_version < SCHEMA_VERSION:
+            self._migrate(existing_version)
         self._set_meta("schema_version", str(SCHEMA_VERSION))
         self._set_meta("created_at", self._get_meta("created_at") or str(time.time()))
 
@@ -58,6 +63,29 @@ class Store:
         self.close()
 
     # -- meta / audit ---------------------------------------------------------
+
+    def _existing_version(self) -> int | None:
+        """Schema version already in the file, or None for a fresh database."""
+        row = self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='meta'"
+        ).fetchone()
+        if row is None:
+            return None
+        stored = self.conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+        return int(stored["value"]) if stored else None
+
+    def _migrate(self, from_version: int) -> None:
+        """Bring an older database up to date, one version at a time."""
+        for version in range(from_version + 1, SCHEMA_VERSION + 1):
+            for statement in MIGRATIONS.get(version, []):
+                try:
+                    self.conn.execute(statement)
+                except sqlite3.OperationalError as exc:
+                    # A column the fresh-schema path already created is not an
+                    # error; anything else is.
+                    if "duplicate column name" not in str(exc):
+                        raise
+            self.audit("migrate", f"schema {version}")
 
     def _set_meta(self, key: str, value: str) -> None:
         self.conn.execute(
@@ -84,19 +112,23 @@ class Store:
 
     # -- writing --------------------------------------------------------------
 
-    def add_span(self, span: ActivitySpan) -> int:
-        """Persist one span, its sealed title and its contribution to the rollups."""
+    def add_span(self, span: ActivitySpan, inputs: InputBatch | None = None) -> int:
+        """Persist one span, its sealed title, its input batch and its rollups."""
         day = day_of(span.started_at)
         cat = span.category or Category("uncategorised")
+        counters = inputs.counters if inputs else InputCounters()
         cur = self.conn.execute(
             """INSERT INTO spans(started_at, ended_at, duration, day, app, title_hash,
                                  category, subcategory, rule_id, confidence, afk,
-                                 visibility, sample_count, backend)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                 visibility, sample_count, backend,
+                                 keystrokes, clicks, scrolls, mouse_distance)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 span.started_at, span.ended_at, span.duration, day, span.app,
                 span.title_hash, cat.name, cat.subcategory, cat.rule_id, cat.confidence,
                 int(span.afk), span.visibility.value, span.sample_count, span.backend,
+                counters.keystrokes, counters.clicks, counters.scrolls,
+                round(counters.mouse_distance, 1),
             ),
         )
         span_id = int(cur.lastrowid)
@@ -111,6 +143,9 @@ class Store:
                     "INSERT INTO span_titles(span_id, sealed) VALUES(?, ?)", (span_id, sealed)
                 )
 
+        if inputs is not None and inputs.events:
+            self._store_inputs(span_id, inputs)
+
         self.conn.execute(
             """INSERT INTO daily_rollups(day, app, category, seconds, span_count, afk_seconds)
                VALUES(?,?,?,?,1,?)
@@ -121,6 +156,43 @@ class Store:
             (day, span.app, cat.name, span.duration, span.duration if span.afk else 0.0),
         )
         return span_id
+
+    def _store_inputs(self, span_id: int, batch: InputBatch) -> None:
+        """Compress, seal and store one span's input events.
+
+        One sealed blob per span rather than a row per keystroke: a million-row
+        table of individual key events would be both slow and a far more
+        inviting target.
+        """
+        payload = zlib.compress(json.dumps(batch.to_dict()).encode("utf-8"), 6)
+        sealed = self.vault.seal_blob(payload)
+        if sealed is None:
+            # Fail closed, exactly as titles do: no key means nothing recorded.
+            return
+        self.conn.execute(
+            "INSERT INTO span_inputs(span_id, sealed, event_count, fidelity) VALUES(?,?,?,?)",
+            (span_id, sealed, len(batch.events), batch.fidelity),
+        )
+
+    def inputs_of(self, span_id: int) -> InputBatch | None:
+        """Decrypt one span's input events. The only path that reveals them."""
+        row = self.conn.execute(
+            "SELECT sealed FROM span_inputs WHERE span_id=?", (span_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        raw = self.vault.open_blob(row["sealed"])
+        if raw is None:
+            return None
+        return InputBatch.from_dict(json.loads(zlib.decompress(raw).decode("utf-8")))
+
+    def forget_inputs(self) -> int:
+        """Drop every recorded keystroke and mouse event, keeping the counts."""
+        cur = self.conn.execute("DELETE FROM span_inputs")
+        n = cur.rowcount or 0
+        self.conn.execute("VACUUM")
+        self.audit("forget_inputs", f"{n} input batches deleted")
+        return n
 
     def record_transition(self, from_app: str, to_app: str, at: float) -> None:
         if from_app == to_app:
@@ -195,6 +267,7 @@ class Store:
         return {
             "spans": q("spans"),
             "titles": q("span_titles"),
+            "input_batches": q("span_inputs"),
             "rollup_days": self.conn.execute(
                 "SELECT COUNT(DISTINCT day) c FROM daily_rollups"
             ).fetchone()["c"],
@@ -246,14 +319,25 @@ class Store:
 
     # -- retention, deletion, export -----------------------------------------
 
-    def enforce_retention(self, detail_days: int, title_days: int | None = None) -> dict[str, int]:
+    def enforce_retention(
+        self, detail_days: int, title_days: int | None = None, input_days: int | None = None
+    ) -> dict[str, int]:
         """Delete detailed rows past their retention window.
 
         Rollups are untouched: the user keeps their long-term statistics while
         the revealing per-window records expire on schedule.
         """
-        removed = {"spans": 0, "titles": 0}
+        removed = {"spans": 0, "titles": 0, "inputs": 0}
         now = time.time()
+        if input_days is not None and input_days >= 0:
+            # Input detail expires first: it is the most revealing thing stored.
+            cutoff = now - input_days * 86400
+            cur = self.conn.execute(
+                "DELETE FROM span_inputs WHERE span_id IN "
+                "(SELECT id FROM spans WHERE ended_at < ?)",
+                (cutoff,),
+            )
+            removed["inputs"] = cur.rowcount or 0
         if title_days is not None and title_days >= 0:
             cutoff = now - title_days * 86400
             cur = self.conn.execute(
@@ -266,7 +350,7 @@ class Store:
             cutoff = now - detail_days * 86400
             cur = self.conn.execute("DELETE FROM spans WHERE ended_at < ?", (cutoff,))
             removed["spans"] = cur.rowcount or 0
-        if removed["spans"] or removed["titles"]:
+        if any(removed.values()):
             self.audit("retention", json.dumps(removed))
             self.conn.execute("VACUUM")
         return removed
@@ -290,7 +374,8 @@ class Store:
         """Delete data on the user's command. The 'own your data' escape hatch."""
         if everything:
             counts = self.counts()
-            for table in ("span_titles", "spans", "daily_rollups", "daily_transitions"):
+            for table in ("span_inputs", "span_titles", "spans", "daily_rollups",
+                          "daily_transitions"):
                 self.conn.execute(f"DELETE FROM {table}")
             self.conn.execute("VACUUM")
             self.audit("purge_all", json.dumps(counts))

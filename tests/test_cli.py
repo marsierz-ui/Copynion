@@ -225,12 +225,20 @@ def test_doctor_flags_unredacted_input_as_a_problem(initialised, capsys):
     assert "everything you type is" in out
 
 
-def test_doctor_reports_missing_input_backend(initialised, capsys):
+def test_doctor_reports_unavailable_input_backend(initialised, capsys):
+    """Doctor must flag unavailable input capture whichever reason applies.
+
+    The two reasons are distinct - pynput absent, versus installed but with no
+    display to attach to - and which one holds depends on whether the `input`
+    extra is installed in the environment running the tests. Asserting on the
+    reason made this test pass or fail depending on that, so assert on the
+    problem line instead, which doctor emits either way.
+    """
     config, _ = initialised
     _enable_input(config)
-    main(["doctor"])
+    assert main(["doctor"]) == 1
     out = capsys.readouterr().out
-    assert "no backend is installed" in out or "pip install 'copynion[input]'" in out
+    assert "Input capture is configured but unavailable" in out
 
 
 def test_invalid_input_fidelity_is_rejected(initialised, capsys):

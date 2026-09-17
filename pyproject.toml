@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "copynion"
+version = "0.1.0"
+description = "A local-first AI copying companion that learns how you use your computer."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Copynion contributors" }]
+keywords = ["productivity", "time-tracking", "task-mining", "local-first", "privacy"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Utilities",
+]
+
+# The core runs on the standard library alone. Everything that could weaken the
+# privacy story is an explicit opt-in extra, never a transitive dependency.
+dependencies = []
+
+[project.optional-dependencies]
+# Strongly recommended: enables AES-GCM encryption of window titles at rest.
+crypto = ["cryptography>=41"]
+# Stores the vault key in the OS keychain instead of a 0600 file.
+keyring = ["keyring>=24"]
+# Global keyboard and mouse capture (stage 4 groundwork). Opt-in by design:
+# without it, input fidelity simply stays off and everything else still works.
+input = ["pynput>=1.7"]
+dev = ["pytest>=7.4", "ruff>=0.4"]
+all = ["cryptography>=41", "keyring>=24", "pynput>=1.7"]
+
+[project.scripts]
+copynion = "copynion.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/marsierz-ui/copynion"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+copynion = ["data/*.json", "data/*.toml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["error"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+ignore = ["E501"]

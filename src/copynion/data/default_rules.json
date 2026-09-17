@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "comment": "Built-in classification rules. Copy to ~/.config/copynion/rules.json and edit; matching ids override these. Title regexes run against already-redacted titles.",
+  "rules": [
+    {"id": "dev.ide",        "apps": ["code", "codium", "cursor", "vscodium", "idea*", "pycharm*", "webstorm*", "goland*", "clion*", "rubymine*", "phpstorm*", "android-studio", "eclipse", "netbeans", "xcode", "zed", "sublime_text", "subl", "atom", "nvim-qt", "neovide", "gvim", "vim", "nvim", "helix", "emacs"], "category": "development", "subcategory": "ide", "confidence": 0.95},
+    {"id": "dev.title",      "title": "\\.(py|js|jsx|ts|tsx|go|rs|java|kt|rb|php|c|cc|cpp|h|hpp|cs|swift|sql|sh|yaml|yml|toml)\\b", "category": "development", "subcategory": "source-file", "confidence": 0.70},
+    {"id": "dev.git",        "apps": ["gitkraken", "sourcetree", "fork", "github-desktop", "gitg", "sublime_merge"], "category": "development", "subcategory": "vcs", "confidence": 0.9},
+    {"id": "dev.browser.gh", "apps": ["firefox", "chrome", "google-chrome", "chromium", "brave*", "msedge", "safari", "vivaldi", "librewolf", "zen"], "title": "(github|gitlab|bitbucket|stack ?overflow|localhost:|127\\.0\\.0\\.1)", "category": "development", "subcategory": "web", "confidence": 0.85},
+
+    {"id": "term.emulator",  "apps": ["gnome-terminal*", "konsole", "xterm", "urxvt", "alacritty", "kitty", "wezterm", "terminator", "tilix", "hyper", "iterm2", "terminal", "windowsterminal", "wt", "cmd", "powershell", "pwsh", "foot", "st"], "category": "terminal", "confidence": 0.9},
+    {"id": "term.ssh",       "title": "\\b(ssh|ssh:)\\b", "category": "sysadmin", "subcategory": "remote", "confidence": 0.75},
+
+    {"id": "data.sheets",    "apps": ["localc", "gnumeric", "excel", "soffice*", "numbers", "tad"], "category": "data_entry", "subcategory": "spreadsheet", "confidence": 0.95},
+    {"id": "data.sheets.web","apps": ["firefox", "chrome", "google-chrome", "chromium", "brave*", "msedge", "safari", "vivaldi"], "title": "(google sheets|airtable|smartsheet|\\.xlsx?\\b|\\.csv\\b)", "category": "data_entry", "subcategory": "spreadsheet-web", "confidence": 0.85},
+    {"id": "data.db",        "apps": ["dbeaver", "datagrip", "pgadmin*", "mysql-workbench", "tableplus", "sequel-pro", "sequel-ace", "beekeeper*", "sqlitebrowser"], "category": "data_entry", "subcategory": "database", "confidence": 0.9},
+    {"id": "data.bi",        "apps": ["tableau", "powerbi*", "looker*", "metabase"], "category": "data_entry", "subcategory": "bi", "confidence": 0.85},
+
+    {"id": "docs.writer",    "apps": ["lowriter", "winword", "word", "pages", "abiword", "typora", "obsidian", "notion", "logseq", "joplin", "onenote", "bear", "zettlr", "ghostwriter", "marktext"], "category": "documents", "confidence": 0.9},
+    {"id": "docs.pdf",       "apps": ["evince", "okular", "zathura", "acrord32", "acrobat", "preview", "sioyek", "mupdf", "xpdf", "foxitreader"], "category": "documents", "subcategory": "reading", "confidence": 0.85},
+    {"id": "docs.web",       "apps": ["firefox", "chrome", "google-chrome", "chromium", "brave*", "msedge", "safari", "vivaldi"], "title": "(google docs|confluence|notion\\.so|coda\\.io|\\.docx?\\b)", "category": "documents", "subcategory": "web", "confidence": 0.85},
+
+    {"id": "comm.mail",      "apps": ["thunderbird", "outlook", "mail", "evolution", "geary", "mailspring", "bluemail", "kmail", "spark", "superhuman"], "category": "communication", "subcategory": "email", "confidence": 0.95},
+    {"id": "comm.chat",      "apps": ["slack", "discord", "telegram*", "signal*", "whatsapp*", "element", "rocket.chat", "mattermost", "skype", "messenger", "wire", "threema"], "category": "communication", "subcategory": "chat", "confidence": 0.9},
+    {"id": "comm.mail.web",  "apps": ["firefox", "chrome", "google-chrome", "chromium", "brave*", "msedge", "safari", "vivaldi"], "title": "(gmail|inbox|outlook\\.|mail\\.(google|yahoo|proton))", "category": "communication", "subcategory": "webmail", "confidence": 0.85},
+
+    {"id": "meet.app",       "apps": ["zoom", "zoom.us", "teams*", "webex*", "gotomeeting", "bluejeans", "whereby"], "category": "meetings", "confidence": 0.9},
+    {"id": "meet.web",       "apps": ["firefox", "chrome", "google-chrome", "chromium", "brave*", "msedge", "safari", "vivaldi"], "title": "(google meet|\\bmeet\\.google\\b|zoom\\.us|teams\\.microsoft|jitsi)", "category": "meetings", "subcategory": "web", "confidence": 0.9},
+
+    {"id": "pm.app",         "apps": ["jira*", "linear", "asana", "trello", "clickup", "monday*", "basecamp", "height", "shortcut"], "category": "project_mgmt", "confidence": 0.9},
+    {"id": "pm.web",         "apps": ["firefox", "chrome", "google-chrome", "chromium", "brave*", "msedge", "safari", "vivaldi"], "title": "(jira|linear\\.app|asana|trello|clickup|monday\\.com|youtrack|redmine|\\basana\\b)", "category": "project_mgmt", "subcategory": "web", "confidence": 0.85},
+
+    {"id": "design.app",     "apps": ["figma", "sketch", "inkscape", "gimp", "krita", "photoshop", "illustrator", "affinity*", "blender", "canva", "penpot"], "category": "design", "confidence": 0.9},
+
+    {"id": "files.manager",  "apps": ["nautilus", "dolphin", "thunar", "nemo", "pcmanfm", "explorer", "finder", "ranger", "krusader", "doublecmd", "totalcmd", "caja"], "category": "file_mgmt", "confidence": 0.95},
+
+    {"id": "sys.settings",   "apps": ["gnome-control-center", "systemsettings*", "systempreferences", "control", "gnome-system-monitor", "htop", "btop", "taskmgr", "activity-monitor", "synaptic", "gnome-disks"], "category": "sysadmin", "confidence": 0.85},
+    {"id": "sys.vm",         "apps": ["virtualbox*", "vmware*", "virt-manager", "docker-desktop", "rancher-desktop", "utm"], "category": "sysadmin", "subcategory": "virtualisation", "confidence": 0.85},
+
+    {"id": "media.player",   "apps": ["vlc", "mpv", "spotify", "rhythmbox", "audacious", "totem", "quodlibet", "clementine", "strawberry", "music", "tidal", "plex*"], "category": "media", "confidence": 0.9},
+    {"id": "media.edit",     "apps": ["audacity", "kdenlive", "davinci*", "obs", "shotcut", "ardour", "reaper", "premiere*", "finalcut*"], "category": "media", "subcategory": "editing", "confidence": 0.85},
+
+    {"id": "leisure.web",    "apps": ["firefox", "chrome", "google-chrome", "chromium", "brave*", "msedge", "safari", "vivaldi"], "title": "(youtube|netflix|reddit|twitter|\\bx\\.com\\b|instagram|facebook|tiktok|twitch|hacker ?news|9gag)", "category": "leisure", "confidence": 0.8},
+    {"id": "leisure.games",  "apps": ["steam", "lutris", "heroic", "minecraft*", "gamescope"], "category": "leisure", "subcategory": "games", "confidence": 0.9},
+
+    {"id": "research.web",   "apps": ["firefox", "chrome", "google-chrome", "chromium", "brave*", "msedge", "safari", "vivaldi", "zen", "librewolf"], "title": "(wikipedia|docs\\.|documentation|\\bmdn\\b|arxiv|scholar|readthedocs|devdocs|\\bapi reference\\b)", "category": "research", "subcategory": "web", "confidence": 0.8},
+    {"id": "research.browser","apps": ["firefox", "chrome", "google-chrome", "chromium", "brave*", "msedge", "safari", "vivaldi", "zen", "librewolf", "epiphany", "falkon", "qutebrowser"], "category": "research", "subcategory": "general-browsing", "confidence": 0.35}
+  ]
+}
